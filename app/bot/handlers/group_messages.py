@@ -82,35 +82,56 @@ async def handle_supergroup_message(message: Message, session: AsyncSession, bot
 
     log_entry.rag_score = rag_score
 
-    # 5. Route: High Confidence RAG -> Auto Reply
+    # 5. High Confidence RAG → Auto Reply immediately (no Gemini needed)
     if best_match and rag_score >= settings.rag_confidence_threshold:
         logger.info("High RAG confidence match, auto-replying", score=rag_score)
         await message.reply(best_match.answer)
         log_entry.was_auto_replied = True
         return
 
-    # 6. Route: Low Confidence -> Generate Draft & Route to Moderator Chat
-    context_str = f"Похожий вопрос из базы: {best_match.question_original}\nОтвет: {best_match.answer}" if best_match else None
-    draft_answer = await llm_service.generate_draft_answer(
+    # 6. Build RAG context string for Gemini
+    context_str = (
+        f"Похожий вопрос из базы: {best_match.question_original}\nОтвет: {best_match.answer}"
+        if best_match else None
+    )
+
+    # 7. Ask Gemini to generate answer
+    gemini_answer, should_escalate = await llm_service.generate_answer(
         question=text,
         language=courier.language,
         rag_context=context_str,
     )
 
+    # 8a. Gemini IS confident → reply to courier directly, no moderator needed
+    if not should_escalate:
+        logger.info("Gemini confident answer, auto-replying to courier", answer=gemini_answer[:60])
+        await message.reply(gemini_answer)
+        log_entry.was_auto_replied = True
+        # Log it as resolved ticket (no moderator action needed)
+        await ticket_repo.create_ticket(
+            message_log_id=log_entry.id,
+            courier_id=courier.id,
+            draft_answer=gemini_answer,
+        )
+        return
+
+    # 8b. Gemini is NOT confident → escalate to Moderator Chat
+    logger.info("Gemini escalating to moderator", rag_score=rag_score)
+
     ticket = await ticket_repo.create_ticket(
         message_log_id=log_entry.id,
         courier_id=courier.id,
-        draft_answer=draft_answer,
+        draft_answer=gemini_answer,
     )
 
-    # Send ticket card to Moderator Chat
     ticket_card_text = (
-        f"🚨 <b>НОВЫЙ ВОПРОС КУРЬЕРА</b>\n\n"
+        f"🚨 <b>ВОПРОС КУРЬЕРА — ТРЕБУЕТ ОТВЕТА МОДЕРАТОРА</b>\n\n"
         f"<b>Курьер:</b> {user.full_name} (@{user.username or 'без юзернейма'})\n"
         f"<b>Язык:</b> {courier.language}\n"
         f"<b>Вопрос:</b> {text}\n\n"
         f"🔍 <b>RAG Score:</b> {rag_score:.2f}\n"
-        f"💡 <b>Черновик AI (Gemini):</b> {draft_answer}"
+        f"🤖 <b>Gemini не смог ответить уверенно.</b>\n\n"
+        f"✏️ Напишите ваш ответ в этот чат — бот покажет превью перед отправкой курьеру."
     )
 
     mod_msg = await bot.send_message(
@@ -121,4 +142,4 @@ async def handle_supergroup_message(message: Message, session: AsyncSession, bot
     )
 
     ticket.moderator_chat_msg_id = mod_msg.message_id
-    logger.info("Created ticket for moderator approval", ticket_id=str(ticket.id))
+    logger.info("Escalated to moderator", ticket_id=str(ticket.id))
