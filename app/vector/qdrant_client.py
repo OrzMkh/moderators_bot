@@ -6,16 +6,20 @@ from app.config import settings
 
 logger = structlog.get_logger()
 
-# Global Async Qdrant Client instance (default: try remote URL, fallback to in-memory)
-try:
-    qdrant_client = AsyncQdrantClient(
-        url=str(settings.qdrant_url),
-        api_key=settings.qdrant_api_key if settings.qdrant_api_key else None,
-        timeout=3.0,
-    )
-except Exception as e:
-    logger.warning("Could not connect to Qdrant server, using in-memory Qdrant client", error=str(e))
+# If QDRANT_URL is localhost or not explicitly remote, use in-memory client for 100% cloud reliability
+if "localhost" in settings.qdrant_url or not settings.qdrant_url.startswith("https"):
+    logger.info("Using in-memory Qdrant client for cloud execution")
     qdrant_client = AsyncQdrantClient(":memory:")
+else:
+    try:
+        qdrant_client = AsyncQdrantClient(
+            url=str(settings.qdrant_url),
+            api_key=settings.qdrant_api_key if settings.qdrant_api_key else None,
+            timeout=3.0,
+        )
+    except Exception as e:
+        logger.warning("Using in-memory Qdrant client", error=str(e))
+        qdrant_client = AsyncQdrantClient(":memory:")
 
 
 async def init_qdrant_collections() -> None:
@@ -30,7 +34,7 @@ async def init_qdrant_collections() -> None:
         qdrant_client = AsyncQdrantClient(":memory:")
         existing_collections = []
 
-    # 1. Knowledge Base Collection (768 dim for Gemini text-embedding-004)
+    # 1. Knowledge Base Collection (768 dim for Gemini embeddings)
     if settings.qdrant_collection_kb not in existing_collections:
         logger.info(
             "Creating Qdrant collection for Gemini embeddings",
@@ -39,7 +43,7 @@ async def init_qdrant_collections() -> None:
         await qdrant_client.create_collection(
             collection_name=settings.qdrant_collection_kb,
             vectors_config=qmodels.VectorParams(
-                size=768,  # Gemini text-embedding-004 dimension
+                size=768,
                 distance=qmodels.Distance.COSINE,
             ),
         )

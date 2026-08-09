@@ -118,6 +118,16 @@ async def handle_start_edit_ticket(
     await state.set_state(ModeratorStates.waiting_for_edit_text)
     await state.update_data(ticket_id=str(ticket.id), card_msg_id=query.message.message_id)
 
+    # Disable buttons on original card to prevent accidental approval while editing
+    try:
+        await query.message.edit_text(
+            text=query.message.html_text + "\n\n✏️ <i>(Ожидается ввод нового текста ответа...)</i>",
+            parse_mode="HTML",
+            reply_markup=None,
+        )
+    except Exception:
+        pass
+
     await query.message.reply(
         f"✏️ Отправьте новым сообщением исправленный текст ответа курьеру:"
     )
