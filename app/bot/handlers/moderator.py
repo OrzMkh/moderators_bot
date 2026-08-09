@@ -62,8 +62,14 @@ async def handle_approve_ticket(
                 reply_to_message_id=ticket.message_log.telegram_msg_id,
             )
             logger.info("Sent approved answer to courier", chat_id=ticket.message_log.chat_id)
-        except Exception as e:
-            logger.error("Failed to send to courier", error=str(e))
+        except Exception:
+            try:
+                await bot.send_message(
+                    chat_id=ticket.message_log.chat_id,
+                    text=final_answer,
+                )
+            except Exception as e:
+                logger.error("Failed to send to courier", error=str(e))
 
     mod_name = query.from_user.full_name
     try:
@@ -144,13 +150,18 @@ async def handle_receive_edited_text(
         ticket = await ticket_repo.get_by_id(uuid.UUID(ticket_id_str))
         logger.info("Found ticket from memory", ticket_id=ticket_id_str)
 
-    # 2. Fallback: query DB for any active unanswered ticket
+    # 2. Fallback: query DB for active unanswered ticket
     if not ticket:
         ticket = await ticket_repo.get_active_unanswered_ticket()
-        logger.info("Found ticket from DB fallback", ticket_id=str(ticket.id) if ticket else None)
+        logger.info("Found ticket from active DB fallback", ticket_id=str(ticket.id) if ticket else None)
+
+    # 3. Ultimate fallback: get absolute latest ticket
+    if not ticket:
+        ticket = await ticket_repo.get_latest_ticket()
+        logger.info("Found ticket from ultimate DB fallback", ticket_id=str(ticket.id) if ticket else None)
 
     if not ticket:
-        logger.info("No active ticket found to edit", text=message.text)
+        logger.info("No ticket found in database at all")
         return
 
     edited_answer = message.text
@@ -211,8 +222,15 @@ async def handle_confirm_send_edited(
                 reply_to_message_id=ticket.message_log.telegram_msg_id,
             )
             logger.info("Sent confirmed answer to courier", chat_id=ticket.message_log.chat_id)
-        except Exception as e:
-            logger.error("Failed to send to courier", error=str(e))
+        except Exception:
+            try:
+                await bot.send_message(
+                    chat_id=ticket.message_log.chat_id,
+                    text=final_answer,
+                )
+                logger.info("Sent confirmed answer to courier without reply_to", chat_id=ticket.message_log.chat_id)
+            except Exception as e:
+                logger.error("Failed to send to courier", error=str(e))
 
     mod_name = query.from_user.full_name
     try:
