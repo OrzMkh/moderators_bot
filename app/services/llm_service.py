@@ -64,9 +64,9 @@ class LLMAnswerService:
             raw = (response.choices[0].message.content or "").strip()
             logger.info("Gemini response", raw=raw[:80])
 
-            # Check if Gemini explicitly escalated
+            # Check if Gemini explicitly escalated or returned empty
             if raw.upper().startswith("ESCALATE") or not raw:
-                return raw, True
+                return "Здравствуйте! Спасибо за обращение. Уточняем информацию по вашему вопросу.", True
 
             # Check for fallback phrases
             low = raw.lower()
@@ -78,14 +78,16 @@ class LLMAnswerService:
 
         except Exception as e:
             logger.error("Gemini answer generation failed", error=str(e), question=question[:50])
-            return "Спасибо за вопрос! Передаю оператору поддержки.", True
+            return "Здравствуйте! Спасибо за обращение. Мы проверяем информацию и скоро ответим.", True
 
-    # Keep backward compatibility alias
     async def generate_draft_answer(
         self,
         question: str,
         language: str = "ru",
         rag_context: str | None = None,
     ) -> str:
+        """Generate a draft answer for moderator review."""
         answer, _ = await self.generate_answer(question, language, rag_context)
+        if not answer or answer.strip().upper() == "ESCALATE":
+            return "Здравствуйте! Спасибо за обращение. Уточняем информацию по вашему вопросу."
         return answer

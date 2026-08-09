@@ -42,6 +42,20 @@ class TicketRepository:
         result = await self._session.execute(stmt)
         return result.scalar_one_or_none()
 
+    async def get_by_moderator_msg_id(self, moderator_chat_msg_id: int) -> Ticket | None:
+        """Fetch ticket by moderator chat message ID."""
+        stmt = (
+            select(Ticket)
+            .where(Ticket.moderator_chat_msg_id == moderator_chat_msg_id)
+            .options(
+                selectinload(Ticket.message_log),
+                selectinload(Ticket.courier),
+            )
+            .order_by(Ticket.created_at.desc())
+        )
+        result = await self._session.execute(stmt)
+        return result.scalars().first()
+
     async def get_active_unanswered_ticket(self) -> Ticket | None:
         """Fetch the latest active unanswered ticket (waiting_edit, pending, or waiting_confirm)."""
         stmt = (

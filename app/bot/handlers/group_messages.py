@@ -1,3 +1,4 @@
+import html
 import structlog
 from aiogram import F, Router, Bot
 from aiogram.types import Message
@@ -51,7 +52,7 @@ async def handle_supergroup_message(message: Message, session: AsyncSession, bot
     # 2. Intent Classification
     intent_result = await intent_service.classify(text)
     logger.info(
-        "Intent classified via Gemini",
+        "Intent classified",
         user_id=user.id,
         intent=intent_result.intent,
         confidence=intent_result.confidence,
@@ -82,10 +83,13 @@ async def handle_supergroup_message(message: Message, session: AsyncSession, bot
 
     log_entry.rag_score = rag_score
 
-    # 5. High Confidence RAG → Auto Reply immediately (no Gemini needed)
+    # 5. High Confidence RAG (>= 0.85) -> Auto Reply immediately from verified KB
     if best_match and rag_score >= settings.rag_confidence_threshold:
         logger.info("High RAG confidence match, auto-replying", score=rag_score)
-        await message.reply(best_match.answer)
+        try:
+            await message.reply(best_match.answer)
+        except Exception:
+            await bot.send_message(chat_id=message.chat.id, text=best_match.answer)
         log_entry.was_auto_replied = True
         return
 
@@ -95,51 +99,60 @@ async def handle_supergroup_message(message: Message, session: AsyncSession, bot
         if best_match else None
     )
 
-    # 7. Ask Gemini to generate answer
-    gemini_answer, should_escalate = await llm_service.generate_answer(
+    # 7. Ask Gemini to generate draft answer for moderators
+    draft_answer = await llm_service.generate_draft_answer(
         question=text,
         language=courier.language,
         rag_context=context_str,
     )
 
-    # 8a. Gemini IS confident → reply to courier directly, no moderator needed
-    if not should_escalate:
-        logger.info("Gemini confident answer, auto-replying to courier", answer=gemini_answer[:60])
-        await message.reply(gemini_answer)
-        log_entry.was_auto_replied = True
-        # Log it as resolved ticket (no moderator action needed)
-        await ticket_repo.create_ticket(
-            message_log_id=log_entry.id,
-            courier_id=courier.id,
-            draft_answer=gemini_answer,
-        )
-        return
-
-    # 8b. Gemini is NOT confident → escalate to Moderator Chat
-    logger.info("Gemini escalating to moderator", rag_score=rag_score)
+    # 8. Escalate to Moderator Chat
+    logger.info("Escalating to moderator", rag_score=rag_score)
 
     ticket = await ticket_repo.create_ticket(
         message_log_id=log_entry.id,
         courier_id=courier.id,
-        draft_answer=gemini_answer,
+        draft_answer=draft_answer,
     )
+
+    safe_name = html.escape(user.full_name or "Курьер")
+    safe_uname = f"@{user.username}" if user.username else "без юзернейма"
+    safe_question = html.escape(text)
+    safe_draft = html.escape(draft_answer)
 
     ticket_card_text = (
         f"🚨 <b>ВОПРОС КУРЬЕРА — ТРЕБУЕТ ОТВЕТА МОДЕРАТОРА</b>\n\n"
-        f"<b>Курьер:</b> {user.full_name} (@{user.username or 'без юзернейма'})\n"
-        f"<b>Язык:</b> {courier.language}\n"
-        f"<b>Вопрос:</b> {text}\n\n"
-        f"🔍 <b>RAG Score:</b> {rag_score:.2f}\n"
-        f"🤖 <b>Gemini не смог ответить уверенно.</b>\n\n"
-        f"✏️ Напишите ваш ответ в этот чат — бот покажет превью перед отправкой курьеру."
+        f"👤 <b>Курьер:</b> {safe_name} ({safe_uname})\n"
+        f"🌐 <b>Язык:</b> {courier.language}\n"
+        f"❓ <b>Вопрос:</b> {safe_question}\n\n"
+        f"🔍 <b>RAG Score:</b> {rag_score:.2f} (порог авто-ответа {settings.rag_confidence_threshold})\n"
+        f"🤖 <b>Черновик ответа ИИ:</b>\n"
+        f"<i>«{safe_draft}»</i>\n\n"
+        f"💡 Нажмите <b>[✅ Одобрить]</b> для отправки черновика или <b>[✏️ Отредактировать]</b> для своего ответа."
     )
 
-    mod_msg = await bot.send_message(
-        chat_id=settings.moderator_chat_id,
-        text=ticket_card_text,
-        reply_markup=get_moderator_ticket_keyboard(str(ticket.id)),
-        parse_mode="HTML",
-    )
-
-    ticket.moderator_chat_msg_id = mod_msg.message_id
-    logger.info("Escalated to moderator", ticket_id=str(ticket.id))
+    try:
+        mod_msg = await bot.send_message(
+            chat_id=settings.moderator_chat_id,
+            text=ticket_card_text,
+            reply_markup=get_moderator_ticket_keyboard(str(ticket.id)),
+            parse_mode="HTML",
+        )
+        ticket.moderator_chat_msg_id = mod_msg.message_id
+        await session.flush()
+        logger.info("Escalated to moderator", ticket_id=str(ticket.id), msg_id=mod_msg.message_id)
+    except Exception as e:
+        logger.error("Failed to send HTML ticket card to moderator chat, trying plain text", error=str(e))
+        plain_card_text = (
+            f"🚨 ВОПРОС КУРЬЕРА — ТРЕБУЕТ ОТВЕТА МОДЕРАТОРА\n\n"
+            f"Курьер: {user.full_name} ({safe_uname})\n"
+            f"Вопрос: {text}\n\n"
+            f"Черновик ответа ИИ:\n«{draft_answer}»"
+        )
+        mod_msg = await bot.send_message(
+            chat_id=settings.moderator_chat_id,
+            text=plain_card_text,
+            reply_markup=get_moderator_ticket_keyboard(str(ticket.id)),
+        )
+        ticket.moderator_chat_msg_id = mod_msg.message_id
+        await session.flush()

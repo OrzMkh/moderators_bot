@@ -21,6 +21,9 @@ from app.vector.qdrant_client import qdrant_client
 logger = structlog.get_logger()
 
 moderator_router = Router()
+# Strict filter: ONLY catch updates originating from the moderator chat
+moderator_router.message.filter(F.chat.id == settings.moderator_chat_id)
+moderator_router.callback_query.filter(F.chat.id == settings.moderator_chat_id)
 
 rlhf_service = RLHFService(None, qdrant_client)
 
@@ -57,6 +60,7 @@ async def handle_approve_ticket(
             was_edited=False,
         )
 
+        courier_sent = False
         if ticket.message_log:
             try:
                 await bot.send_message(
@@ -64,26 +68,41 @@ async def handle_approve_ticket(
                     text=final_answer,
                     reply_to_message_id=ticket.message_log.telegram_msg_id,
                 )
-                logger.info("Sent approved answer to courier", chat_id=ticket.message_log.chat_id)
-            except Exception:
+                courier_sent = True
+                logger.info("Sent approved answer to courier with reply", chat_id=ticket.message_log.chat_id)
+            except Exception as e:
+                logger.warning("Could not send with reply_to_message_id, trying direct send", error=str(e))
                 try:
                     await bot.send_message(
                         chat_id=ticket.message_log.chat_id,
                         text=final_answer,
                     )
-                except Exception as e:
-                    logger.error("Failed to send to courier", error=str(e))
+                    courier_sent = True
+                except Exception as e2:
+                    logger.error("Failed to send directly to courier chat", error=str(e2))
+
+        if not courier_sent:
+            try:
+                await bot.send_message(
+                    chat_id=settings.supergroup_id,
+                    text=final_answer,
+                )
+                logger.info("Sent approved answer to fallback supergroup")
+            except Exception as e3:
+                logger.error("Fallback supergroup send failed", error=str(e3))
 
         mod_name = query.from_user.full_name
         try:
+            current_text = query.message.html_text or query.message.text or ""
             await query.message.edit_text(
-                text=query.message.html_text + f"\n\n✅ <b>ОДОБРЕНО</b> (@{query.from_user.username or mod_name})",
+                text=current_text + f"\n\n✅ <b>ОДОБРЕНО</b> (@{query.from_user.username or mod_name})",
                 parse_mode="HTML",
                 reply_markup=None,
             )
             await query.answer("Ответ одобрен и отправлен курьеру!")
         except Exception as e:
             logger.error("Failed to update card", error=str(e))
+            await query.answer("Ответ отправлен курьеру!")
 
         try:
             await rlhf_service.add_approved_knowledge(
@@ -120,8 +139,9 @@ async def handle_start_edit_ticket(
         logger.info("Stored pending edit in memory", moderator_id=query.from_user.id, ticket_id=callback_data.ticket_id)
 
         try:
+            current_text = query.message.html_text or query.message.text or ""
             await query.message.edit_text(
-                text=query.message.html_text + "\n\n✏️ <i>(Ожидается ввод нового текста ответа...)</i>",
+                text=current_text + "\n\n✏️ <i>(Ожидается ввод нового текста ответа...)</i>",
                 parse_mode="HTML",
                 reply_markup=None,
             )
@@ -134,18 +154,14 @@ async def handle_start_edit_ticket(
         logger.error("Error in handle_start_edit_ticket", error=str(e))
 
 
-@moderator_router.message()
+@moderator_router.message(F.text & ~F.text.startswith("/"))
 async def handle_receive_edited_text(
     message: Message,
     session: AsyncSession,
     bot: Bot,
 ) -> None:
     """Catches any text from moderator chat — shows confirmation preview before sending to courier."""
-    if not message.text or not message.from_user or message.text.startswith("/"):
-        return
-
-    # Check chat ID matching explicitly
-    if str(message.chat.id) != str(settings.moderator_chat_id):
+    if not message.text or not message.from_user:
         return
 
     moderator_id = message.from_user.id
@@ -154,15 +170,18 @@ async def handle_receive_edited_text(
     edited_answer = message.text
     ticket_id_target = _pending_edit.get(moderator_id)
 
-    # Database lookup wrapped safely
     ticket = None
+    ticket_repo = TicketRepository(session)
+
     try:
-        ticket_repo = TicketRepository(session)
         if ticket_id_target:
             try:
                 ticket = await ticket_repo.get_by_id(uuid.UUID(ticket_id_target))
             except Exception:
                 ticket = None
+
+        if not ticket and message.reply_to_message:
+            ticket = await ticket_repo.get_by_moderator_msg_id(message.reply_to_message.message_id)
 
         if not ticket:
             ticket = await ticket_repo.get_active_unanswered_ticket()
@@ -191,7 +210,6 @@ async def handle_receive_edited_text(
         f"Отправить этот текст курьеру?"
     )
 
-    # ALWAYS send preview card with button - zero exceptions allowed to stop this!
     try:
         await message.reply(
             text=confirm_card_text,
@@ -201,19 +219,15 @@ async def handle_receive_edited_text(
         logger.info("SUCCESS: Sent preview card with button to moderator chat!")
     except Exception as e:
         logger.error("Failed to send HTML preview card, sending plain text card", error=str(e))
-        try:
-            plain_card_text = (
-                f"📋 ПРЕДВАРИТЕЛЬНЫЙ ПРОСМОТР ОТВЕТА КУРЬЕРУ:\n\n"
-                f"«{edited_answer}»\n\n"
-                f"Отправить этот текст курьеру?"
-            )
-            await message.reply(
-                text=plain_card_text,
-                reply_markup=get_confirm_send_keyboard(ticket_id_target),
-            )
-            logger.info("SUCCESS: Sent plain text preview card with button!")
-        except Exception as e2:
-            logger.critical("Critical error sending preview card", error=str(e2))
+        plain_card_text = (
+            f"📋 ПРЕДВАРИТЕЛЬНЫЙ ПРОСМОТР ОТВЕТА КУРЬЕРУ:\n\n"
+            f"«{edited_answer}»\n\n"
+            f"Отправить этот текст курьеру?"
+        )
+        await message.reply(
+            text=plain_card_text,
+            reply_markup=get_confirm_send_keyboard(ticket_id_target),
+        )
 
 
 @moderator_router.callback_query(ModeratorAction.filter(F.action == "confirm_send"))
@@ -242,7 +256,7 @@ async def handle_confirm_send_edited(
                 was_edited=True,
             )
 
-        # 1. Send answer to Courier Supergroup
+        # 1. Send answer to Courier Supergroup / Chat
         courier_sent = False
         if ticket and ticket.message_log:
             try:
@@ -252,18 +266,19 @@ async def handle_confirm_send_edited(
                     reply_to_message_id=ticket.message_log.telegram_msg_id,
                 )
                 courier_sent = True
-            except Exception:
+                logger.info("Sent edited answer to courier with reply", chat_id=ticket.message_log.chat_id)
+            except Exception as e:
+                logger.warning("Failed to send with reply_to_message_id, trying direct send", error=str(e))
                 try:
                     await bot.send_message(
                         chat_id=ticket.message_log.chat_id,
                         text=final_answer,
                     )
                     courier_sent = True
-                except Exception as e:
-                    logger.error("Failed to send to courier", error=str(e))
+                except Exception as e2:
+                    logger.error("Failed to send to courier", error=str(e2))
 
         if not courier_sent:
-            # Fallback send directly to supergroup
             try:
                 await bot.send_message(
                     chat_id=settings.supergroup_id,
@@ -275,11 +290,12 @@ async def handle_confirm_send_edited(
 
         # 2. Update Card in Moderator Chat
         mod_name = query.from_user.full_name
+        safe_answer = html.escape(final_answer)
         try:
             await query.message.edit_text(
                 text=(
                     f"🚀 <b>ОТВЕТ ОТПРАВЛЕН КУРЬЕРУ</b> (@{query.from_user.username or mod_name})\n\n"
-                    f"<b>Текст:</b> <i>«{html.escape(final_answer)}»</i>"
+                    f"<b>Текст:</b> <i>«{safe_answer}»</i>"
                 ),
                 parse_mode="HTML",
                 reply_markup=None,
@@ -346,7 +362,7 @@ async def handle_cancel_edit_ticket(
 
     try:
         await query.message.edit_text(
-            text="❌ Отменено. Тикет возвращён.",
+            text="❌ Отменено. Тикет возвращён в очередь.",
             reply_markup=get_moderator_ticket_keyboard(str(callback_data.ticket_id)),
         )
         await query.answer("Отменено.")
