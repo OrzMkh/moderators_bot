@@ -112,12 +112,13 @@ async def handle_start_edit_ticket(
     await state.update_data(ticket_id=str(ticket.id), card_msg_id=query.message.message_id)
 
     await query.message.reply(
-        "✏️ Отправьте следующим сообщением исправленный текст ответа курьеру:"
+        f"✏️ Отправьте новым сообщением ответ курьеру для тикета <code>{ticket.id}</code>:"
     )
     await query.answer()
 
 
 @moderator_router.message(ModeratorStates.waiting_for_edit_text)
+@moderator_router.message(F.chat.id == settings.moderator_chat_id, F.reply_to_message)
 async def handle_receive_edited_text(
     message: Message,
     state: FSMContext,
@@ -125,18 +126,35 @@ async def handle_receive_edited_text(
     bot: Bot,
 ) -> None:
     """Moderator sends the edited answer text."""
-    if not message.text or not message.from_user:
+    if not message.text or not message.from_user or message.text.startswith("/"):
         return
 
     data = await state.get_data()
-    ticket_id = uuid.UUID(data["ticket_id"])
+    ticket_id_raw = data.get("ticket_id")
     card_msg_id = data.get("card_msg_id")
 
+    # Fallback: Extract ticket_id from reply message if state was reset
+    if not ticket_id_raw and message.reply_to_message and message.reply_to_message.text:
+        reply_text = message.reply_to_message.text
+        if "тикета" in reply_text:
+            parts = reply_text.split("тикета")
+            if len(parts) > 1:
+                candidate = parts[1].strip().strip(":").strip()
+                try:
+                    ticket_id_raw = str(uuid.UUID(candidate))
+                except ValueError:
+                    pass
+
+    if not ticket_id_raw:
+        # Ignore normal chat chatter in moderator group
+        return
+
+    ticket_id = uuid.UUID(ticket_id_raw)
     ticket_repo = TicketRepository(session)
     ticket = await ticket_repo.get_by_id(ticket_id)
 
-    if not ticket:
-        await message.reply("Ошибка: Тикет не найден.")
+    if not ticket or ticket.status != "pending":
+        await message.reply("⚠️ Ошибка: Тикет уже был обработан ранее.")
         await state.clear()
         return
 
