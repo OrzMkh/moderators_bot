@@ -1,6 +1,7 @@
+import html
 import uuid
 import structlog
-from aiogram import F, Router, Bot
+from aiogram import Router, Bot
 from aiogram.types import CallbackQuery, Message
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -17,8 +18,6 @@ from app.vector.qdrant_client import qdrant_client
 logger = structlog.get_logger()
 
 moderator_router = Router()
-# Router-level filter for Moderator Chat
-moderator_router.message.filter(F.chat.id == settings.moderator_chat_id)
 
 rlhf_service = RLHFService(None, qdrant_client)
 
@@ -138,6 +137,10 @@ async def handle_receive_edited_text(
     if not message.text or not message.from_user or message.text.startswith("/"):
         return
 
+    # Check chat ID matching explicitly in function body
+    if str(message.chat.id) != str(settings.moderator_chat_id):
+        return
+
     moderator_id = message.from_user.id
     logger.info("Received message in moderator chat", user_id=moderator_id, text=message.text)
     ticket_repo = TicketRepository(session)
@@ -155,7 +158,7 @@ async def handle_receive_edited_text(
         ticket = await ticket_repo.get_active_unanswered_ticket()
         logger.info("Found ticket from active DB fallback", ticket_id=str(ticket.id) if ticket else None)
 
-    # 3. Ultimate fallback: get absolute latest ticket
+    # 3. Ultimate fallback: get absolute latest ticket in system
     if not ticket:
         ticket = await ticket_repo.get_latest_ticket()
         logger.info("Found ticket from ultimate DB fallback", ticket_id=str(ticket.id) if ticket else None)
@@ -173,17 +176,31 @@ async def handle_receive_edited_text(
     # Clear in-memory store
     _pending_edit.pop(moderator_id, None)
 
+    safe_text = html.escape(edited_answer)
     confirm_card_text = (
         f"📋 <b>ПРЕДВАРИТЕЛЬНЫЙ ПРОСМОТР ОТВЕТА КУРЬЕРУ:</b>\n\n"
-        f"<i>«{edited_answer}»</i>\n\n"
+        f"<i>«{safe_text}»</i>\n\n"
         f"Отправить этот текст курьеру?"
     )
 
-    await message.reply(
-        text=confirm_card_text,
-        reply_markup=get_confirm_send_keyboard(str(ticket.id)),
-        parse_mode="HTML",
-    )
+    try:
+        await message.reply(
+            text=confirm_card_text,
+            reply_markup=get_confirm_send_keyboard(str(ticket.id)),
+            parse_mode="HTML",
+        )
+        logger.info("Sent HTML preview card with button to moderator chat")
+    except Exception as e:
+        logger.error("Failed to send HTML preview card, falling back to plain text", error=str(e))
+        plain_card_text = (
+            f"📋 ПРЕДВАРИТЕЛЬНЫЙ ПРОСМОТР ОТВЕТА КУРЬЕРУ:\n\n"
+            f"«{edited_answer}»\n\n"
+            f"Отправить этот текст курьеру?"
+        )
+        await message.reply(
+            text=plain_card_text,
+            reply_markup=get_confirm_send_keyboard(str(ticket.id)),
+        )
 
 
 @moderator_router.callback_query(ModeratorAction.filter(F.action == "confirm_send"))
@@ -237,14 +254,21 @@ async def handle_confirm_send_edited(
         await query.message.edit_text(
             text=(
                 f"🚀 <b>ОТВЕТ ОТПРАВЛЕН КУРЬЕРУ</b> (@{query.from_user.username or mod_name})\n\n"
-                f"<b>Текст:</b> <i>«{final_answer}»</i>"
+                f"<b>Текст:</b> <i>«{html.escape(final_answer)}»</i>"
             ),
             parse_mode="HTML",
             reply_markup=None,
         )
         await query.answer("Ответ успешно отправлен!")
-    except Exception as e:
-        logger.error("Failed to update card", error=str(e))
+    except Exception:
+        await query.message.edit_text(
+            text=(
+                f"🚀 ОТВЕТ ОТПРАВЛЕН КУРЬЕРУ (@{query.from_user.username or mod_name})\n\n"
+                f"Текст: «{final_answer}»"
+            ),
+            reply_markup=None,
+        )
+        await query.answer("Ответ успешно отправлен!")
 
     try:
         await rlhf_service.add_approved_knowledge(
