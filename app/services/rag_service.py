@@ -4,6 +4,7 @@ from openai import AsyncOpenAI
 from qdrant_client import AsyncQdrantClient
 
 from app.config import settings
+from app.vector.qdrant_client import ensure_collection
 
 logger = structlog.get_logger()
 
@@ -41,6 +42,7 @@ class RAGService:
         """Searches vector DB for matching knowledge base entries."""
         try:
             vector = await self.get_embedding(query)
+            await ensure_collection(settings.qdrant_collection_kb, len(vector))
 
             # Compatible search call for all qdrant-client versions
             if hasattr(self._qdrant, "query_points"):

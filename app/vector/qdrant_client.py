@@ -22,42 +22,38 @@ else:
         qdrant_client = AsyncQdrantClient(":memory:")
 
 
-async def init_qdrant_collections() -> None:
-    """Creates Qdrant collections if they do not exist."""
+async def ensure_collection(collection_name: str, dim: int = 3072) -> None:
+    """Ensures collection exists and has matching vector dimension."""
     global qdrant_client
     try:
-        existing_collections = [
-            col.name for col in (await qdrant_client.get_collections()).collections
-        ]
-    except Exception:
-        logger.warning("Switching Qdrant client to in-memory mode")
-        qdrant_client = AsyncQdrantClient(":memory:")
-        existing_collections = []
+        collections = (await qdrant_client.get_collections()).collections
+        existing = [c.name for c in collections]
+        if collection_name in existing:
+            try:
+                info = await qdrant_client.get_collection(collection_name)
+                vec_params = info.config.params.vectors
+                current_dim = getattr(vec_params, "size", None)
+                if current_dim and current_dim != dim:
+                    logger.info("Recreating Qdrant collection with matching dim", collection=collection_name, old_dim=current_dim, new_dim=dim)
+                    await qdrant_client.delete_collection(collection_name)
+                    existing.remove(collection_name)
+            except Exception:
+                pass
 
-    # 1. Knowledge Base Collection (768 dim for Gemini embeddings)
-    if settings.qdrant_collection_kb not in existing_collections:
-        logger.info(
-            "Creating Qdrant collection for Gemini embeddings",
-            collection=settings.qdrant_collection_kb
-        )
-        await qdrant_client.create_collection(
-            collection_name=settings.qdrant_collection_kb,
-            vectors_config=qmodels.VectorParams(
-                size=768,
-                distance=qmodels.Distance.COSINE,
-            ),
-        )
+        if collection_name not in existing:
+            await qdrant_client.create_collection(
+                collection_name=collection_name,
+                vectors_config=qmodels.VectorParams(
+                    size=dim,
+                    distance=qmodels.Distance.COSINE,
+                ),
+            )
+            logger.info("Created Qdrant collection", collection=collection_name, dim=dim)
+    except Exception as e:
+        logger.warning("Error ensuring Qdrant collection", error=str(e))
 
-    # 2. Courier Short-term Context Collection
-    if settings.qdrant_collection_ctx not in existing_collections:
-        logger.info(
-            "Creating Qdrant collection",
-            collection=settings.qdrant_collection_ctx
-        )
-        await qdrant_client.create_collection(
-            collection_name=settings.qdrant_collection_ctx,
-            vectors_config=qmodels.VectorParams(
-                size=768,
-                distance=qmodels.Distance.COSINE,
-            ),
-        )
+
+async def init_qdrant_collections() -> None:
+    """Creates Qdrant collections if they do not exist."""
+    await ensure_collection(settings.qdrant_collection_kb, 3072)
+    await ensure_collection(settings.qdrant_collection_ctx, 3072)

@@ -21,9 +21,8 @@ from app.vector.qdrant_client import qdrant_client
 logger = structlog.get_logger()
 
 moderator_router = Router()
-# Strict filter: ONLY catch updates originating from the moderator chat
+# Strict filter for messages: ONLY catch text updates originating from the moderator chat
 moderator_router.message.filter(F.chat.id == settings.moderator_chat_id)
-moderator_router.callback_query.filter(F.chat.id == settings.moderator_chat_id)
 
 rlhf_service = RLHFService(None, qdrant_client)
 

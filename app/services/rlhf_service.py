@@ -6,6 +6,7 @@ from qdrant_client import AsyncQdrantClient
 from qdrant_client.http import models as qmodels
 
 from app.config import settings
+from app.vector.qdrant_client import ensure_collection
 
 logger = structlog.get_logger()
 
@@ -37,6 +38,7 @@ class RLHFService:
                 input=question,
             )
             vector = response.data[0].embedding
+            await ensure_collection(settings.qdrant_collection_kb, len(vector))
             point_id = str(uuid.uuid4())
 
             payload = {
