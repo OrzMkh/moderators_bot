@@ -1,7 +1,7 @@
 import html
 import uuid
 import structlog
-from aiogram import Router, Bot
+from aiogram import F, Router, Bot
 from aiogram.types import CallbackQuery, Message
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
