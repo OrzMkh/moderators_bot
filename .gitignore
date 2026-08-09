@@ -1,0 +1,22 @@
+# Environment variables & secrets
+.env
+*.env
+
+# SQLite Databases & WAL files
+*.db
+*.db-shm
+*.db-wal
+courier.db
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+ENV/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store

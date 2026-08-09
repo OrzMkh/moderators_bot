@@ -1,0 +1,37 @@
+services:
+  - type: web
+    name: courier-bot
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: SUPERGROUP_ID
+        sync: false
+      - key: MODERATOR_CHAT_ID
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: QDRANT_URL
+        sync: false
+      - key: QDRANT_API_KEY
+        sync: false
+      - key: WEBHOOK_SECRET
+        sync: false
+      - key: RENDER_EXTERNAL_URL
+        sync: false
+    healthCheckPath: /health
+    autoDeploy: true
+
+  - type: cron
+    name: keep-alive-ping
+    runtime: python
+    schedule: "*/14 * * * *"   # каждые 14 минут (Render засыпает через 15)
+    buildCommand: pip install httpx
+    startCommand: python scripts/ping_server.py
+    envVars:
+      - key: RENDER_APP_URL
+        sync: false
