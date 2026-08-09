@@ -1,7 +1,6 @@
 import structlog
 from aiogram import F, Router, Bot
 from aiogram.types import Message
-from google import genai
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -23,12 +22,9 @@ group_router.message.filter(
     F.chat.id != settings.moderator_chat_id,
 )
 
-# Initialize native Google GenAI SDK Client
-genai_sdk_client = genai.Client(api_key=settings.gemini_api_key)
-
-intent_service = IntentClassifierService(genai_sdk_client)
-rag_service = RAGService(genai_sdk_client, qdrant_client)
-llm_service = LLMAnswerService(genai_sdk_client)
+intent_service = IntentClassifierService()
+rag_service = RAGService(None, qdrant_client)
+llm_service = LLMAnswerService()
 
 
 @group_router.message(F.text & ~F.text.startswith("/"))

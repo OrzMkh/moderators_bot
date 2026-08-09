@@ -1,7 +1,6 @@
-import asyncio
 from dataclasses import dataclass
 import structlog
-from google import genai
+from openai import AsyncOpenAI
 from qdrant_client import AsyncQdrantClient
 
 from app.config import settings
@@ -21,23 +20,22 @@ class RAGMatch:
 class RAGService:
     def __init__(
         self,
-        gemini_client: genai.Client,
+        gemini_client: any,
         qdrant_client: AsyncQdrantClient,
     ) -> None:
-        self._gemini = gemini_client
+        self._openai_client = AsyncOpenAI(
+            api_key=settings.gemini_api_key,
+            base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+        )
         self._qdrant = qdrant_client
 
     async def get_embedding(self, text: str) -> list[float]:
-        """Generates embedding vector using Gemini gemini-embedding-001 (non-blocking thread)."""
-        def _call_api():
-            return self._gemini.models.embed_content(
-                model=settings.gemini_model_embed,
-                contents=text,
-            )
-
-        response = await asyncio.to_thread(_call_api)
-        vals = response.embedding.values if hasattr(response, "embedding") and response.embedding else response.embeddings[0].values
-        return list(vals)
+        """Generates embedding vector using OpenAI compatible Gemini endpoint."""
+        response = await self._openai_client.embeddings.create(
+            model=settings.gemini_model_embed,
+            input=text,
+        )
+        return response.data[0].embedding
 
     async def search(self, query: str, limit: int = 5) -> list[RAGMatch]:
         """Searches vector DB for matching knowledge base entries."""

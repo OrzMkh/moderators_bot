@@ -1,6 +1,7 @@
 import asyncio
+import json
 import structlog
-from google import genai
+from openai import AsyncOpenAI
 from pydantic import BaseModel, Field
 
 from app.config import settings
@@ -28,21 +29,24 @@ class IntentResult(BaseModel):
 
 
 class IntentClassifierService:
-    def __init__(self, gemini_client: genai.Client) -> None:
-        self._client = gemini_client
+    def __init__(self, gemini_client: any = None) -> None:
+        self._openai_client = AsyncOpenAI(
+            api_key=settings.gemini_api_key,
+            base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+        )
 
     async def classify(self, text: str) -> IntentResult:
-        """Classifies courier message using google.genai SDK (non-blocking thread)."""
+        """Classifies courier message using OpenAI compatible Gemini endpoint."""
         try:
-            def _call_api():
-                return self._client.models.generate_content(
-                    model=settings.gemini_model_intent,
-                    contents=f"{INTENT_SYSTEM_PROMPT}\n\nСообщение: {text}",
-                    config={"response_mime_type": "application/json"},
-                )
-
-            response = await asyncio.to_thread(_call_api)
-            raw_content = response.text or "{}"
+            response = await self._openai_client.chat.completions.create(
+                model=settings.gemini_model_intent,
+                messages=[
+                    {"role": "system", "content": INTENT_SYSTEM_PROMPT},
+                    {"role": "user", "content": text},
+                ],
+                response_format={"type": "json_object"},
+            )
+            raw_content = response.choices[0].message.content or "{}"
             return IntentResult.model_validate_json(raw_content)
         except Exception as e:
             logger.error("Intent classification failed", error=str(e), text=text[:50])

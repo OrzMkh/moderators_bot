@@ -1,6 +1,5 @@
-import asyncio
 import structlog
-from google import genai
+from openai import AsyncOpenAI
 
 from app.config import settings
 
@@ -18,8 +17,11 @@ ANSWER_SYSTEM_PROMPT = """
 
 
 class LLMAnswerService:
-    def __init__(self, gemini_client: genai.Client) -> None:
-        self._client = gemini_client
+    def __init__(self, gemini_client: any = None) -> None:
+        self._openai_client = AsyncOpenAI(
+            api_key=settings.gemini_api_key,
+            base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+        )
 
     async def generate_draft_answer(
         self,
@@ -27,20 +29,20 @@ class LLMAnswerService:
         language: str = "ru",
         rag_context: str | None = None,
     ) -> str:
-        """Generates draft answer using google.genai SDK (non-blocking thread)."""
+        """Generates draft answer using OpenAI compatible Gemini endpoint."""
         sys_prompt = ANSWER_SYSTEM_PROMPT.format(language=language)
         if rag_context:
             sys_prompt += f"\n\nКонтекст из базы знаний:\n{rag_context}"
 
         try:
-            def _call_api():
-                return self._client.models.generate_content(
-                    model=settings.gemini_model_chat,
-                    contents=f"{sys_prompt}\n\nВопрос курьера: {question}",
-                )
-
-            response = await asyncio.to_thread(_call_api)
-            return response.text or "Спасибо за обращение! Оператор скоро ответит вам."
+            response = await self._openai_client.chat.completions.create(
+                model=settings.gemini_model_chat,
+                messages=[
+                    {"role": "system", "content": sys_prompt},
+                    {"role": "user", "content": f"Вопрос курьера: {question}"},
+                ],
+            )
+            return response.choices[0].message.content or "Спасибо за обращение! Оператор скоро ответит вам."
         except Exception as e:
             logger.error("Gemini draft generation failed", error=str(e), question=question[:50])
             return "Спасибо за вопрос! Передаю оператору поддержки."

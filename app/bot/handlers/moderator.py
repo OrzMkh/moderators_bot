@@ -4,7 +4,6 @@ from aiogram import F, Router, Bot
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, Message
-from google import genai
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -17,8 +16,7 @@ logger = structlog.get_logger()
 
 moderator_router = Router()
 
-genai_sdk_client = genai.Client(api_key=settings.gemini_api_key)
-rlhf_service = RLHFService(genai_sdk_client, qdrant_client)
+rlhf_service = RLHFService(None, qdrant_client)
 
 
 class ModeratorStates(StatesGroup):

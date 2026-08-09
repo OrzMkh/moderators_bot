@@ -1,8 +1,7 @@
-import asyncio
 from datetime import datetime, timezone
 import uuid
 import structlog
-from google import genai
+from openai import AsyncOpenAI
 from qdrant_client import AsyncQdrantClient
 from qdrant_client.http import models as qmodels
 
@@ -14,10 +13,13 @@ logger = structlog.get_logger()
 class RLHFService:
     def __init__(
         self,
-        gemini_client: genai.Client,
+        gemini_client: any,
         qdrant_client: AsyncQdrantClient,
     ) -> None:
-        self._gemini = gemini_client
+        self._openai_client = AsyncOpenAI(
+            api_key=settings.gemini_api_key,
+            base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+        )
         self._qdrant = qdrant_client
 
     async def add_approved_knowledge(
@@ -28,17 +30,13 @@ class RLHFService:
         service_type: str | None = None,
         ticket_id: str | None = None,
     ) -> str:
-        """Vectorizes and upserts an approved or edited moderator answer into Qdrant KB using Gemini."""
+        """Vectorizes and upserts an approved or edited moderator answer into Qdrant KB using Gemini embeddings."""
         try:
-            def _call_api():
-                return self._gemini.models.embed_content(
-                    model=settings.gemini_model_embed,
-                    contents=question,
-                )
-
-            response = await asyncio.to_thread(_call_api)
-            vals = response.embedding.values if hasattr(response, "embedding") and response.embedding else response.embeddings[0].values
-            vector = list(vals)
+            response = await self._openai_client.embeddings.create(
+                model=settings.gemini_model_embed,
+                input=question,
+            )
+            vector = response.data[0].embedding
             point_id = str(uuid.uuid4())
 
             payload = {
