@@ -41,20 +41,33 @@ class RAGService:
         """Searches vector DB for matching knowledge base entries."""
         try:
             vector = await self.get_embedding(query)
-            search_result = await self._qdrant.search(
-                collection_name=settings.qdrant_collection_kb,
-                query_vector=vector,
-                limit=limit,
-            )
+
+            # Compatible search call for all qdrant-client versions
+            if hasattr(self._qdrant, "query_points"):
+                res = await self._qdrant.query_points(
+                    collection_name=settings.qdrant_collection_kb,
+                    query=vector,
+                    limit=limit,
+                )
+                search_result = getattr(res, "points", [])
+            elif hasattr(self._qdrant, "search"):
+                search_result = await self._qdrant.search(
+                    collection_name=settings.qdrant_collection_kb,
+                    query_vector=vector,
+                    limit=limit,
+                )
+            else:
+                search_result = []
 
             matches: list[RAGMatch] = []
             for hit in search_result:
-                payload = hit.payload or {}
+                payload = getattr(hit, "payload", {}) or {}
+                score = getattr(hit, "score", 0.0)
                 matches.append(
                     RAGMatch(
                         question_original=payload.get("question_original", ""),
                         answer=payload.get("answer", ""),
-                        score=hit.score,
+                        score=score,
                         language=payload.get("language", "ru"),
                         source=payload.get("source", "unknown"),
                     )

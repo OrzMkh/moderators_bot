@@ -17,11 +17,12 @@ from app.vector.qdrant_client import qdrant_client
 logger = structlog.get_logger()
 
 moderator_router = Router()
+# Router-level filter for Moderator Chat
+moderator_router.message.filter(F.chat.id == settings.moderator_chat_id)
 
 rlhf_service = RLHFService(None, qdrant_client)
 
-# In-memory store: moderator_tg_id -> ticket_id (UUID string)
-# This survives within a single worker process lifespan
+# Global in-memory edit tracking: moderator_tg_id -> ticket_id (UUID string)
 _pending_edit: dict[int, str] = {}
 
 
@@ -60,6 +61,7 @@ async def handle_approve_ticket(
                 text=final_answer,
                 reply_to_message_id=ticket.message_log.telegram_msg_id,
             )
+            logger.info("Sent approved answer to courier", chat_id=ticket.message_log.chat_id)
         except Exception as e:
             logger.error("Failed to send to courier", error=str(e))
 
@@ -104,7 +106,6 @@ async def handle_start_edit_ticket(
 
     await ticket_repo.set_waiting_edit(ticket_id=ticket_id, moderator_tg_id=query.from_user.id)
 
-    # Store in memory so the text handler can find it instantly without DB lookup issues
     _pending_edit[query.from_user.id] = str(ticket_id)
     logger.info("Stored pending edit in memory", moderator_id=query.from_user.id, ticket_id=str(ticket_id))
 
@@ -121,34 +122,35 @@ async def handle_start_edit_ticket(
     await query.answer()
 
 
-@moderator_router.message(F.chat.id == settings.moderator_chat_id)
+@moderator_router.message()
 async def handle_receive_edited_text(
     message: Message,
     session: AsyncSession,
     bot: Bot,
 ) -> None:
-    """Catches any text from moderator — shows confirmation preview before sending to courier."""
+    """Catches any text from moderator chat — shows confirmation preview before sending to courier."""
     if not message.text or not message.from_user or message.text.startswith("/"):
         return
 
     moderator_id = message.from_user.id
+    logger.info("Received message in moderator chat", user_id=moderator_id, text=message.text)
     ticket_repo = TicketRepository(session)
 
-    # 1. Try in-memory store first (most reliable, no DB round-trip needed)
+    # 1. Try in-memory store first
     ticket_id_str = _pending_edit.get(moderator_id)
     ticket = None
 
     if ticket_id_str:
         ticket = await ticket_repo.get_by_id(uuid.UUID(ticket_id_str))
-        logger.info("Found ticket from in-memory store", ticket_id=ticket_id_str)
+        logger.info("Found ticket from memory", ticket_id=ticket_id_str)
 
-    # 2. Fallback: query DB for any unanswered ticket
+    # 2. Fallback: query DB for any active unanswered ticket
     if not ticket:
         ticket = await ticket_repo.get_active_unanswered_ticket()
         logger.info("Found ticket from DB fallback", ticket_id=str(ticket.id) if ticket else None)
 
     if not ticket:
-        logger.info("No active ticket found, ignoring moderator message")
+        logger.info("No active ticket found to edit", text=message.text)
         return
 
     edited_answer = message.text
