@@ -1,8 +1,6 @@
 import uuid
 import structlog
 from aiogram import F, Router, Bot
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, Message
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -22,9 +20,9 @@ moderator_router = Router()
 
 rlhf_service = RLHFService(None, qdrant_client)
 
-
-class ModeratorStates(StatesGroup):
-    waiting_for_edit_text = State()
+# In-memory store: moderator_tg_id -> ticket_id (UUID string)
+# This survives within a single worker process lifespan
+_pending_edit: dict[int, str] = {}
 
 
 @moderator_router.callback_query(ModeratorAction.filter(F.action == "approve"))
@@ -34,7 +32,6 @@ async def handle_approve_ticket(
     session: AsyncSession,
     bot: Bot,
 ) -> None:
-    """Moderator approves draft answer as-is."""
     if not query.from_user or not query.message:
         return
 
@@ -48,7 +45,6 @@ async def handle_approve_ticket(
 
     final_answer = ticket.draft_answer
 
-    # 1. Update ticket in DB
     await ticket_repo.update_status(
         ticket_id=ticket_id,
         status="approved",
@@ -57,7 +53,6 @@ async def handle_approve_ticket(
         was_edited=False,
     )
 
-    # 2. Reply to Courier in Supergroup / PM
     if ticket.message_log:
         try:
             await bot.send_message(
@@ -65,22 +60,20 @@ async def handle_approve_ticket(
                 text=final_answer,
                 reply_to_message_id=ticket.message_log.telegram_msg_id,
             )
-            logger.info("Sent approved answer to courier", chat_id=ticket.message_log.chat_id)
         except Exception as e:
-            logger.error("Failed to send message to courier", error=str(e))
+            logger.error("Failed to send to courier", error=str(e))
 
-    # 3. Update Moderator Chat Message Card
     mod_name = query.from_user.full_name
-    updated_card_text = (
-        query.message.html_text + f"\n\n✅ <b>ОДОБРЕНО МОДЕРАТОРОМ</b> (@{query.from_user.username or mod_name})"
-    )
     try:
-        await query.message.edit_text(text=updated_card_text, parse_mode="HTML", reply_markup=None)
+        await query.message.edit_text(
+            text=query.message.html_text + f"\n\n✅ <b>ОДОБРЕНО</b> (@{query.from_user.username or mod_name})",
+            parse_mode="HTML",
+            reply_markup=None,
+        )
         await query.answer("Ответ одобрен и отправлен курьеру!")
     except Exception as e:
-        logger.error("Failed to update moderator message card", error=str(e))
+        logger.error("Failed to update card", error=str(e))
 
-    # 4. Async Vectorize Q&A into Qdrant KB via Gemini (RLHF Loop)
     try:
         await rlhf_service.add_approved_knowledge(
             question=ticket.message_log.raw_text if ticket.message_log else "",
@@ -88,19 +81,16 @@ async def handle_approve_ticket(
             language=ticket.courier.language if ticket.courier else "ru",
             ticket_id=str(ticket.id),
         )
-        ticket.rlhf_vectorized = True
     except Exception as e:
-        logger.error("RLHF vectorization skipped or failed on approval", error=str(e))
+        logger.error("RLHF skipped", error=str(e))
 
 
 @moderator_router.callback_query(ModeratorAction.filter(F.action == "edit"))
 async def handle_start_edit_ticket(
     query: CallbackQuery,
     callback_data: ModeratorAction,
-    state: FSMContext,
     session: AsyncSession,
 ) -> None:
-    """Moderator clicks Edit button -> set ticket state in DB & FSM."""
     if not query.message or not query.from_user:
         return
 
@@ -112,13 +102,12 @@ async def handle_start_edit_ticket(
         await query.answer("Тикет уже обработан.", show_alert=True)
         return
 
-    # Mark ticket as waiting_edit in Database for persistent stateless webhooks
     await ticket_repo.set_waiting_edit(ticket_id=ticket_id, moderator_tg_id=query.from_user.id)
 
-    await state.set_state(ModeratorStates.waiting_for_edit_text)
-    await state.update_data(ticket_id=str(ticket.id), card_msg_id=query.message.message_id)
+    # Store in memory so the text handler can find it instantly without DB lookup issues
+    _pending_edit[query.from_user.id] = str(ticket_id)
+    logger.info("Stored pending edit in memory", moderator_id=query.from_user.id, ticket_id=str(ticket_id))
 
-    # Disable buttons on original card to prevent accidental approval while editing
     try:
         await query.message.edit_text(
             text=query.message.html_text + "\n\n✏️ <i>(Ожидается ввод нового текста ответа...)</i>",
@@ -128,39 +117,48 @@ async def handle_start_edit_ticket(
     except Exception:
         pass
 
-    await query.message.reply(
-        f"✏️ Отправьте новым сообщением исправленный текст ответа курьеру:"
-    )
+    await query.message.reply("✏️ Отправьте новым сообщением исправленный текст ответа курьеру:")
     await query.answer()
 
 
 @moderator_router.message(F.chat.id == settings.moderator_chat_id)
 async def handle_receive_edited_text(
     message: Message,
-    state: FSMContext,
     session: AsyncSession,
     bot: Bot,
 ) -> None:
-    """Moderator sends text -> show confirmation card before sending to courier."""
+    """Catches any text from moderator — shows confirmation preview before sending to courier."""
     if not message.text or not message.from_user or message.text.startswith("/"):
         return
 
+    moderator_id = message.from_user.id
     ticket_repo = TicketRepository(session)
-    # Fetch active unanswered ticket
-    ticket = await ticket_repo.get_active_unanswered_ticket()
+
+    # 1. Try in-memory store first (most reliable, no DB round-trip needed)
+    ticket_id_str = _pending_edit.get(moderator_id)
+    ticket = None
+
+    if ticket_id_str:
+        ticket = await ticket_repo.get_by_id(uuid.UUID(ticket_id_str))
+        logger.info("Found ticket from in-memory store", ticket_id=ticket_id_str)
+
+    # 2. Fallback: query DB for any unanswered ticket
+    if not ticket:
+        ticket = await ticket_repo.get_active_unanswered_ticket()
+        logger.info("Found ticket from DB fallback", ticket_id=str(ticket.id) if ticket else None)
 
     if not ticket:
-        # Ignore regular banter between moderators
+        logger.info("No active ticket found, ignoring moderator message")
         return
 
     edited_answer = message.text
 
-    # Store candidate final_answer in DB & update status to waiting_confirm
+    # Update ticket in DB
     ticket.final_answer = edited_answer
     ticket.status = "waiting_confirm"
-    await session.flush()
 
-    await state.clear()
+    # Clear in-memory store
+    _pending_edit.pop(moderator_id, None)
 
     confirm_card_text = (
         f"📋 <b>ПРЕДВАРИТЕЛЬНЫЙ ПРОСМОТР ОТВЕТА КУРЬЕРУ:</b>\n\n"
@@ -182,7 +180,6 @@ async def handle_confirm_send_edited(
     session: AsyncSession,
     bot: Bot,
 ) -> None:
-    """Moderator clicks '🚀 Да, отправить курьеру'."""
     if not query.from_user or not query.message:
         return
 
@@ -196,7 +193,6 @@ async def handle_confirm_send_edited(
 
     final_answer = ticket.final_answer
 
-    # 1. Mark status as edited
     await ticket_repo.update_status(
         ticket_id=ticket_id,
         status="edited",
@@ -205,7 +201,6 @@ async def handle_confirm_send_edited(
         was_edited=True,
     )
 
-    # 2. Reply to Courier in Supergroup / PM
     if ticket.message_log:
         try:
             await bot.send_message(
@@ -213,23 +208,24 @@ async def handle_confirm_send_edited(
                 text=final_answer,
                 reply_to_message_id=ticket.message_log.telegram_msg_id,
             )
-            logger.info("Sent confirmed edited answer to courier", chat_id=ticket.message_log.chat_id)
+            logger.info("Sent confirmed answer to courier", chat_id=ticket.message_log.chat_id)
         except Exception as e:
-            logger.error("Failed to send message to courier", error=str(e))
+            logger.error("Failed to send to courier", error=str(e))
 
-    # 3. Update Confirmation Card Message in Moderator Chat
     mod_name = query.from_user.full_name
-    updated_card_text = (
-        f"🚀 <b>ОТВЕТ УСПЕШНО ОТПРАВЛЕН КУРЬЕРУ</b> (@{query.from_user.username or mod_name})\n\n"
-        f"<b>Итоговый текст:</b>\n<i>«{final_answer}»</i>"
-    )
     try:
-        await query.message.edit_text(text=updated_card_text, parse_mode="HTML", reply_markup=None)
-        await query.answer("Ответ успешно отправлен курьеру!")
+        await query.message.edit_text(
+            text=(
+                f"🚀 <b>ОТВЕТ ОТПРАВЛЕН КУРЬЕРУ</b> (@{query.from_user.username or mod_name})\n\n"
+                f"<b>Текст:</b> <i>«{final_answer}»</i>"
+            ),
+            parse_mode="HTML",
+            reply_markup=None,
+        )
+        await query.answer("Ответ успешно отправлен!")
     except Exception as e:
-        logger.error("Failed to update confirm message card", error=str(e))
+        logger.error("Failed to update card", error=str(e))
 
-    # 4. RLHF Vectorization
     try:
         await rlhf_service.add_approved_knowledge(
             question=ticket.message_log.raw_text if ticket.message_log else "",
@@ -237,19 +233,16 @@ async def handle_confirm_send_edited(
             language=ticket.courier.language if ticket.courier else "ru",
             ticket_id=str(ticket.id),
         )
-        ticket.rlhf_vectorized = True
     except Exception as e:
-        logger.error("RLHF vectorization skipped or failed on confirm edit", error=str(e))
+        logger.error("RLHF skipped", error=str(e))
 
 
 @moderator_router.callback_query(ModeratorAction.filter(F.action == "reedit"))
 async def handle_reedit_ticket(
     query: CallbackQuery,
     callback_data: ModeratorAction,
-    state: FSMContext,
     session: AsyncSession,
 ) -> None:
-    """Moderator clicks '✏️ Изменить еще раз'."""
     if not query.message or not query.from_user:
         return
 
@@ -257,8 +250,7 @@ async def handle_reedit_ticket(
     ticket_repo = TicketRepository(session)
     await ticket_repo.set_waiting_edit(ticket_id=ticket_id, moderator_tg_id=query.from_user.id)
 
-    await state.set_state(ModeratorStates.waiting_for_edit_text)
-    await state.update_data(ticket_id=str(ticket_id), card_msg_id=query.message.message_id)
+    _pending_edit[query.from_user.id] = str(ticket_id)
 
     await query.message.edit_text(
         text="✏️ Введите новый исправленный текст ответа курьеру:",
@@ -271,11 +263,9 @@ async def handle_reedit_ticket(
 async def handle_cancel_edit_ticket(
     query: CallbackQuery,
     callback_data: ModeratorAction,
-    state: FSMContext,
     session: AsyncSession,
 ) -> None:
-    """Moderator clicks '❌ Отменить'."""
-    if not query.message:
+    if not query.message or not query.from_user:
         return
 
     ticket_id = uuid.UUID(callback_data.ticket_id)
@@ -283,11 +273,11 @@ async def handle_cancel_edit_ticket(
     ticket = await ticket_repo.get_by_id(ticket_id)
     if ticket:
         ticket.status = "pending"
-        await session.flush()
 
-    await state.clear()
+    _pending_edit.pop(query.from_user.id, None)
+
     await query.message.edit_text(
-        text="❌ Редактирование отменено. Карточка возвращена в исходное состояние.",
+        text="❌ Отменено. Тикет возвращён.",
         reply_markup=get_moderator_ticket_keyboard(str(ticket_id)),
     )
     await query.answer("Отменено.")
