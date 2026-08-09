@@ -38,7 +38,7 @@ async def handle_approve_ticket(
     ticket_repo = TicketRepository(session)
     ticket = await ticket_repo.get_by_id(ticket_id)
 
-    if not ticket or ticket.status != "pending":
+    if not ticket or ticket.status not in ("pending", "waiting_edit"):
         await query.answer("Тикет уже обработан или не найден.", show_alert=True)
         return
 
@@ -96,17 +96,20 @@ async def handle_start_edit_ticket(
     state: FSMContext,
     session: AsyncSession,
 ) -> None:
-    """Moderator clicks Edit button -> enter FSM state to wait for text input."""
-    if not query.message:
+    """Moderator clicks Edit button -> set ticket state in DB & FSM."""
+    if not query.message or not query.from_user:
         return
 
     ticket_id = uuid.UUID(callback_data.ticket_id)
     ticket_repo = TicketRepository(session)
     ticket = await ticket_repo.get_by_id(ticket_id)
 
-    if not ticket or ticket.status != "pending":
+    if not ticket or ticket.status not in ("pending", "waiting_edit"):
         await query.answer("Тикет уже обработан.", show_alert=True)
         return
+
+    # Mark ticket as waiting_edit in Database for persistent stateless webhooks
+    await ticket_repo.set_waiting_edit(ticket_id=ticket_id, moderator_tg_id=query.from_user.id)
 
     await state.set_state(ModeratorStates.waiting_for_edit_text)
     await state.update_data(ticket_id=str(ticket.id), card_msg_id=query.message.message_id)
@@ -117,50 +120,36 @@ async def handle_start_edit_ticket(
     await query.answer()
 
 
-@moderator_router.message(ModeratorStates.waiting_for_edit_text)
-@moderator_router.message(F.chat.id == settings.moderator_chat_id, F.reply_to_message)
+@moderator_router.message(F.chat.id == settings.moderator_chat_id)
 async def handle_receive_edited_text(
     message: Message,
     state: FSMContext,
     session: AsyncSession,
     bot: Bot,
 ) -> None:
-    """Moderator sends the edited answer text."""
+    """Moderator sends text in moderator chat -> check DB for pending waiting_edit ticket."""
     if not message.text or not message.from_user or message.text.startswith("/"):
         return
 
-    data = await state.get_data()
-    ticket_id_raw = data.get("ticket_id")
-    card_msg_id = data.get("card_msg_id")
-
-    # Fallback: Extract ticket_id from reply message if state was reset
-    if not ticket_id_raw and message.reply_to_message and message.reply_to_message.text:
-        reply_text = message.reply_to_message.text
-        if "тикета" in reply_text:
-            parts = reply_text.split("тикета")
-            if len(parts) > 1:
-                candidate = parts[1].strip().strip(":").strip()
-                try:
-                    ticket_id_raw = str(uuid.UUID(candidate))
-                except ValueError:
-                    pass
-
-    if not ticket_id_raw:
-        # Ignore normal chat chatter in moderator group
-        return
-
-    ticket_id = uuid.UUID(ticket_id_raw)
     ticket_repo = TicketRepository(session)
-    ticket = await ticket_repo.get_by_id(ticket_id)
+    # Check DB for persistent waiting_edit ticket by this moderator
+    ticket = await ticket_repo.get_waiting_edit_ticket(message.from_user.id)
 
-    if not ticket or ticket.status != "pending":
-        await message.reply("⚠️ Ошибка: Тикет уже был обработан ранее.")
-        await state.clear()
+    if not ticket:
+        # Check FSM state data as fallback
+        data = await state.get_data()
+        ticket_id_raw = data.get("ticket_id")
+        if ticket_id_raw:
+            ticket = await ticket_repo.get_by_id(uuid.UUID(ticket_id_raw))
+
+    if not ticket:
+        # Ignore regular banter between moderators in the chat
         return
 
     edited_answer = message.text
+    ticket_id = ticket.id
 
-    # 1. Update ticket in DB
+    # 1. Update ticket in DB to edited
     await ticket_repo.update_status(
         ticket_id=ticket_id,
         status="edited",
@@ -181,22 +170,10 @@ async def handle_receive_edited_text(
         except Exception as e:
             logger.error("Failed to send edited message to courier", error=str(e))
 
-    # 3. Notify moderator chat
-    if card_msg_id:
-        try:
-            await bot.send_message(
-                chat_id=message.chat.id,
-                text=f"✏️ <b>ОТВЕТ ОТРЕДАКТИРОВАН И ОТПРАВЛЕН КУРЬЕРУ</b>\n\n<b>Итоговый текст:</b>\n{edited_answer}",
-                reply_to_message_id=card_msg_id,
-                parse_mode="HTML",
-            )
-        except Exception as e:
-            logger.error("Failed to notify moderator chat", error=str(e))
-
     await state.clear()
     await message.reply("✅ Исправленный ответ успешно сохранен и отправлен курьеру!")
 
-    # 4. RLHF Vectorization in Qdrant KB via Gemini
+    # 3. RLHF Vectorization in Qdrant KB via Gemini
     try:
         await rlhf_service.add_approved_knowledge(
             question=ticket.message_log.raw_text if ticket.message_log else "",

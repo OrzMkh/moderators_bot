@@ -42,6 +42,31 @@ class TicketRepository:
         result = await self._session.execute(stmt)
         return result.scalar_one_or_none()
 
+    async def get_waiting_edit_ticket(self, moderator_tg_id: int) -> Ticket | None:
+        """Fetch ticket waiting for edit input by this moderator."""
+        stmt = (
+            select(Ticket)
+            .where(Ticket.status == "waiting_edit", Ticket.moderator_tg_id == moderator_tg_id)
+            .options(
+                selectinload(Ticket.message_log),
+                selectinload(Ticket.courier),
+            )
+            .order_by(Ticket.created_at.desc())
+        )
+        result = await self._session.execute(stmt)
+        return result.scalars().first()
+
+    async def set_waiting_edit(self, ticket_id: uuid.UUID, moderator_tg_id: int) -> Ticket | None:
+        """Mark ticket as waiting for moderator edit input."""
+        ticket = await self.get_by_id(ticket_id)
+        if not ticket:
+            return None
+
+        ticket.status = "waiting_edit"
+        ticket.moderator_tg_id = moderator_tg_id
+        await self._session.flush()
+        return ticket
+
     async def update_status(
         self,
         ticket_id: uuid.UUID,
