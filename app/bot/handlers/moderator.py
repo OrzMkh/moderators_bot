@@ -125,6 +125,7 @@ async def handle_start_edit_ticket(
 
 
 @moderator_router.message(F.chat.id == settings.moderator_chat_id)
+@moderator_router.message(ModeratorStates.waiting_for_edit_text)
 async def handle_receive_edited_text(
     message: Message,
     state: FSMContext,
@@ -158,7 +159,7 @@ async def handle_receive_edited_text(
     await state.clear()
 
     confirm_card_text = (
-        f"📋 <b>ПРЕДВАРЕНИТЕЛЬНЫЙ ПРОСМОТР ОТВЕТА КУРЬЕРУ:</b>\n\n"
+        f"📋 <b>ПРЕДВАРИТЕЛЬНЫЙ ПРОСМОТР ОТВЕТА КУРЬЕРУ:</b>\n\n"
         f"<i>«{edited_answer}»</i>\n\n"
         f"Отправить этот текст курьеру?"
     )
