@@ -135,7 +135,6 @@ async def handle_start_edit_ticket(
 
 
 @moderator_router.message(F.chat.id == settings.moderator_chat_id)
-@moderator_router.message(ModeratorStates.waiting_for_edit_text)
 async def handle_receive_edited_text(
     message: Message,
     state: FSMContext,
@@ -147,13 +146,8 @@ async def handle_receive_edited_text(
         return
 
     ticket_repo = TicketRepository(session)
-    ticket = await ticket_repo.get_waiting_edit_ticket(message.from_user.id)
-
-    if not ticket:
-        data = await state.get_data()
-        ticket_id_raw = data.get("ticket_id")
-        if ticket_id_raw:
-            ticket = await ticket_repo.get_by_id(uuid.UUID(ticket_id_raw))
+    # Fetch active unanswered ticket
+    ticket = await ticket_repo.get_active_unanswered_ticket()
 
     if not ticket:
         # Ignore regular banter between moderators

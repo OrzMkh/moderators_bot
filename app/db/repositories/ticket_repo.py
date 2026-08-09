@@ -42,25 +42,9 @@ class TicketRepository:
         result = await self._session.execute(stmt)
         return result.scalar_one_or_none()
 
-    async def get_waiting_edit_ticket(self, moderator_tg_id: int) -> Ticket | None:
-        """Fetch ticket waiting for edit input (matches waiting_edit status or latest pending)."""
-        # First try exact match for this moderator's waiting_edit ticket
+    async def get_active_unanswered_ticket(self) -> Ticket | None:
+        """Fetch the latest active unanswered ticket (waiting_edit or pending)."""
         stmt = (
-            select(Ticket)
-            .where(Ticket.status == "waiting_edit", Ticket.moderator_tg_id == moderator_tg_id)
-            .options(
-                selectinload(Ticket.message_log),
-                selectinload(Ticket.courier),
-            )
-            .order_by(Ticket.created_at.desc())
-        )
-        result = await self._session.execute(stmt)
-        ticket = result.scalars().first()
-        if ticket:
-            return ticket
-
-        # Fallback: get latest pending or waiting_edit ticket in DB
-        stmt_fallback = (
             select(Ticket)
             .where(Ticket.status.in_(["waiting_edit", "pending"]))
             .options(
@@ -69,8 +53,8 @@ class TicketRepository:
             )
             .order_by(Ticket.created_at.desc())
         )
-        result_fallback = await self._session.execute(stmt_fallback)
-        return result_fallback.scalars().first()
+        result = await self._session.execute(stmt)
+        return result.scalars().first()
 
     async def set_waiting_edit(self, ticket_id: uuid.UUID, moderator_tg_id: int) -> Ticket | None:
         """Mark ticket as waiting for moderator edit input."""
