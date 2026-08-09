@@ -14,7 +14,9 @@ services:
       - key: MODERATOR_CHAT_ID
         sync: false
       - key: DATABASE_URL
-        sync: false
+        fromDatabase:
+          name: courier-db
+          property: connectionString
       - key: QDRANT_URL
         sync: false
       - key: QDRANT_API_KEY
@@ -26,10 +28,15 @@ services:
     healthCheckPath: /health
     autoDeploy: true
 
+databases:
+  - name: courier-db
+    databaseName: courier_db
+    plan: free
+
   - type: cron
     name: keep-alive-ping
     runtime: python
-    schedule: "*/14 * * * *"   # каждые 14 минут (Render засыпает через 15)
+    schedule: "*/14 * * * *"
     buildCommand: pip install httpx
     startCommand: python scripts/ping_server.py
     envVars:
